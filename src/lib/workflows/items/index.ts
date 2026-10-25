@@ -15,8 +15,11 @@ import {
   resolveAiProvider,
   type ItemRegenerationInput,
   type RegenerationTarget,
+  pruneExpiredWorkflowSnapshots,
+  WORKFLOW_SNAPSHOT_RETENTION_DAYS,
 } from "@/lib/items/service";
 import { createTaskAiUsageTracker } from "@/lib/tasks/ai-usage";
+import { updateTaskRun } from "@/lib/tasks/service";
 
 function asBackgroundTaskRun(input: unknown): BackgroundTaskRun {
   return input as BackgroundTaskRun;
@@ -31,6 +34,7 @@ type ItemRegenerationStagePayload = {
 type ItemCleanupStagePayload = {
   plan: { cutoff: string; estimatedTotal: number; affectedClusterIds: string[] };
   totalDeleted?: number;
+  prunedSnapshots?: number;
   result?: { totalDeleted: number; affectedClusterCount: number };
 };
 
@@ -155,14 +159,33 @@ export function createItemCleanupWorkflowDefinition(): DomainTaskDefinition {
         },
       },
       {
+        id: "mastra_snapshot_retention",
+        replayPolicy: "at_least_once",
+        execute: async (input, context) => {
+          const payload = input as ItemCleanupStagePayload;
+          const prunedSnapshots = await pruneExpiredWorkflowSnapshots();
+          await context.projectProgress?.(
+            `__mastra_stage_summary__${context.stepId}\n清理运行快照 ${prunedSnapshots} 份（保留 ${WORKFLOW_SNAPSHOT_RETENTION_DAYS} 天内）`,
+          );
+          return { ...payload, prunedSnapshots };
+        },
+      },
+      {
         id: "cluster_finalize",
         replayPolicy: "at_least_once",
-        execute: async (input) => {
+        execute: async (input, context) => {
           const payload = input as ItemCleanupStagePayload;
           const result = await finalizeItemCleanup(
             { ...payload.plan, cutoff: new Date(payload.plan.cutoff) },
             payload.totalDeleted ?? 0,
+            payload.prunedSnapshots ?? 0,
           );
+          if (context.taskRunId) {
+            await updateTaskRun(context.taskRunId, {
+              status: "running",
+              progressLabel: `清理完成：过期条目 ${result.totalDeleted}，聚合重算 ${result.affectedClusterCount}，运行快照 ${result.prunedSnapshots}`,
+            });
+          }
           return { ...payload, result };
         },
       },

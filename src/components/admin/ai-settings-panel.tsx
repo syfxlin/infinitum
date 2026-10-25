@@ -92,6 +92,7 @@ type ModelFormState = {
   modelName: string;
   ingestionItemConcurrency: string;
   customHeaders: HeaderEntry[];
+  customRequestParams: string;
   dimensions: string;
   batchSize: string;
   timeoutMs: string;
@@ -187,6 +188,7 @@ function buildEmptyModelForm(modelType: "chat" | "embedding"): ModelFormState {
     modelName: "gpt-4.1-mini",
     ingestionItemConcurrency: "3",
     customHeaders: [],
+    customRequestParams: "",
     dimensions: "",
     batchSize: "32",
     timeoutMs: "15000",
@@ -456,6 +458,9 @@ export function AiSettingsPanel({ initialSettings, mode, initialPromptType = "it
         key,
         value,
       })),
+      customRequestParams: config.customRequestParams
+        ? JSON.stringify(config.customRequestParams, null, 2)
+        : "",
       dimensions: config.dimensions === null ? "" : String(config.dimensions),
       batchSize: config.batchSize === null ? "" : String(config.batchSize),
       timeoutMs: config.timeoutMs === null ? "" : String(config.timeoutMs),
@@ -518,6 +523,18 @@ export function AiSettingsPanel({ initialSettings, mode, initialPromptType = "it
       return;
     }
 
+    let customRequestParams: Record<string, unknown> = {};
+    if (modelForm.modelType === "chat" && modelForm.customRequestParams.trim()) {
+      try {
+        const parsed: unknown = JSON.parse(modelForm.customRequestParams);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
+        customRequestParams = parsed as Record<string, unknown>;
+      } catch {
+        showToast("自定义请求参数必须是有效的 JSON 对象。", "error");
+        return;
+      }
+    }
+
     setModelSaving(true);
     try {
       const customHeaders = buildCustomHeadersPayload(modelForm.customHeaders);
@@ -534,6 +551,7 @@ export function AiSettingsPanel({ initialSettings, mode, initialPromptType = "it
         modelName: modelForm.modelName,
         ingestionItemConcurrency: Number(ingestionItemConcurrency ?? 3),
         customHeaders,
+        customRequestParams,
         dimensions,
         batchSize,
         timeoutMs,
@@ -1200,6 +1218,16 @@ export function AiSettingsPanel({ initialSettings, mode, initialPromptType = "it
             </div>
           )}
 
+          {modelForm.modelType === "chat" ? (
+            <FormBlock label="自定义请求参数 JSON">
+              <textarea
+                aria-label="自定义请求参数 JSON"
+                value={modelForm.customRequestParams}
+                onChange={(event) => setModelForm(current => ({ ...current, customRequestParams: event.target.value }))}
+                className="min-h-28 w-full rounded-md border border-[var(--border)] bg-[var(--surface)] p-2 font-mono text-sm"
+              />
+            </FormBlock>
+          ) : null}
           <div className="space-y-2">
             <span className={labelClassName}>自定义请求头</span>
             <div className="space-y-2">

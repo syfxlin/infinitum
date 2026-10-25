@@ -11,6 +11,7 @@
 import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
+import { canonicalizeCustomRequestParams } from "./custom-request-params";
 import { generateObject, generateText } from "ai";
 
 import type {
@@ -119,6 +120,57 @@ function isMiniMax(config: ModelApiConfig) {
   return base.includes("minimax") || model.includes("minimax");
 }
 
+/**
+ * 模型能力策略：thinking 开关（集中一处，SDK 与兼容路径共用同一份判定）。
+ *
+ * 官方协议（MiniMax OpenAI 兼容接口，2026-10-20 核对）：
+ * https://platform.minimax.io/docs/api-reference/text-openai-api.md
+ *  - `thinking.type` 可取 `disabled` / `adaptive`；省略即默认开启思考。
+ *  - `MiniMax-M3.1-Flash` 恒思考：显式 `disabled`（含 reasoning_effort=none）
+ *    直接返回 400，错误码 2013：
+ *    `model "MiniMax-M3.1-Flash" requires adaptive thinking;
+ *     thinking.type="disabled" (including reasoning.effort=none) is not allowed (2013)`
+ *  - `MiniMax-M3` 接受 `disabled`（跳过思考直接作答）；M2.x 接受但忽略。
+ *  - `reasoning_split=true` 把思考内容分离到 `reasoning_content`，
+ *    `false` 会把思考包在 content 的 think 标签里；M3.1-Flash 不支持 false。
+ */
+export type ThinkingPolicy = {
+  /** 请求体应写入的 thinking 字段；undefined = 不写（端点默认行为）。 */
+  thinking?: { type: "disabled" | "adaptive" };
+  /** 是否要求把思考内容分离到 reasoning_content（保护 JSON 正文不被 think 标签污染）。 */
+  reasoningSplit?: boolean;
+  /** 该模型是否强制要求 adaptive thinking（禁用 thinking 即 400/2013）。 */
+  requiresAdaptiveThinking: boolean;
+};
+
+/** 强制 adaptive thinking 的模型（官方点名 MiniMax-M3.1-Flash 恒思考）。 */
+const MINIMAX_REQUIRED_ADAPTIVE_PATTERN = /m3[._-]?1[._-]?flash/;
+
+/**
+ * 解析 thinking 策略。
+ *
+ * - 非 MiniMax：不写任何 thinking 字段（沿用 OpenAI 兼容端点默认）。
+ * - MiniMax-M3.1-Flash：必须 adaptive，并把思考分离到 reasoning_content，
+ *   否则思考文本会混进 content，JSON 正文不再可解析。
+ * - 其余 MiniMax 模型（M3 / M2.x）：保持既有 `disabled` 行为不变。
+ */
+export function resolveThinkingPolicy(config: ModelApiConfig): ThinkingPolicy {
+  if (!isMiniMax(config)) {
+    return { requiresAdaptiveThinking: false };
+  }
+  if (MINIMAX_REQUIRED_ADAPTIVE_PATTERN.test(config.model.toLowerCase())) {
+    return {
+      thinking: { type: "adaptive" },
+      reasoningSplit: true,
+      requiresAdaptiveThinking: true,
+    };
+  }
+  return {
+    thinking: { type: "disabled" },
+    requiresAdaptiveThinking: false,
+  };
+}
+
 function getErrorStatus(error: unknown): number | null {
   if (!error || typeof error !== "object") return null;
   const maybe = error as { status?: unknown; statusCode?: unknown; code?: unknown };
@@ -213,6 +265,83 @@ type AuditedDispatchOutcome = {
   usage: UsageSnapshot;
 };
 
+function failedAuditDetails(error: unknown) {
+  const chain: object[] = [];
+  const seen = new Set<object>();
+  let current: unknown = error;
+  for (let depth = 0; depth < 6 && current && typeof current === "object" && !seen.has(current); depth += 1) {
+    seen.add(current);
+    chain.push(current);
+    current = (current as { cause?: unknown }).cause;
+  }
+  const firstString = (key: string) => {
+    for (const item of chain) {
+      const value = (item as Record<string, unknown>)[key];
+      if (typeof value === "string" && value.length > 0) return value;
+    }
+    return undefined;
+  };
+  const number = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+  const rawUsageObjects: Record<string, unknown>[] = [];
+  const normalizedUsageObjects: Record<string, unknown>[] = [];
+  for (const item of chain) {
+    const usage = (item as { usage?: unknown }).usage;
+    if (usage && typeof usage === "object") {
+      const usageRecord = usage as Record<string, unknown>;
+      if (usageRecord.tokenUsageSource !== "estimated" && usageRecord.tokenUsageSource !== "mixed") {
+        const raw = usageRecord.raw;
+        if (raw && typeof raw === "object") rawUsageObjects.push(raw as Record<string, unknown>);
+        else normalizedUsageObjects.push(usageRecord);
+      }
+    }
+    const responseBody = (item as { response?: { body?: unknown } }).response?.body;
+    if (responseBody && typeof responseBody === "object") {
+      const responseUsage = (responseBody as { usage?: unknown }).usage;
+      if (responseUsage && typeof responseUsage === "object") rawUsageObjects.push(responseUsage as Record<string, unknown>);
+    }
+  }
+  // AI SDK usage.totalTokens is normalized by summing input/output tokens. Prefer
+  // provider raw fields when present; without raw usage, retain only the SDK's
+  // direct input/output values and leave total unknown.
+  const usageObjects = rawUsageObjects.length > 0 ? rawUsageObjects : normalizedUsageObjects;
+  const findUsage = (keys: string[]) => {
+    for (const usage of usageObjects) {
+      if (usage.tokenUsageSource === "estimated" || usage.tokenUsageSource === "mixed") continue;
+      for (const key of keys) {
+        const value = number(usage[key]);
+        if (value !== undefined) return value;
+      }
+    }
+    return undefined;
+  };
+  const promptTokens = findUsage(rawUsageObjects.length > 0
+    ? ["prompt_tokens", "input_tokens", "inputTokens", "promptTokens"]
+    : ["inputTokens", "promptTokens"]);
+  const completionTokens = findUsage(rawUsageObjects.length > 0
+    ? ["completion_tokens", "output_tokens", "outputTokens", "completionTokens"]
+    : ["outputTokens", "completionTokens"]);
+  const totalTokens = rawUsageObjects.length > 0
+    ? findUsage(["total_tokens", "totalTokens"])
+    : undefined;
+  const partialUsage = promptTokens !== undefined || completionTokens !== undefined || totalTokens !== undefined
+    ? {
+        ...(promptTokens !== undefined ? { promptTokens } : {}),
+        ...(completionTokens !== undefined ? { completionTokens } : {}),
+        ...(totalTokens !== undefined ? { totalTokens } : {}),
+        tokenUsageSource: "provider" as const,
+      }
+    : undefined;
+  return {
+    errorName: firstString("name"),
+    errorMessage: error instanceof Error ? error.message : String(error),
+    finishReason: firstString("finishReason"),
+    rawText: firstString("text") ?? firstString("responseBody"),
+    usage: partialUsage,
+  };
+}
+
 /**
  * 受控插桩派发：每次真实调用先准入后结算；瞬时已知失败可在额度内受控重试；
  * unknown 结局（未拿到响应）或准入拒绝直接抛终态错误，绝不自动重试。
@@ -252,12 +381,10 @@ async function dispatchWithAudit<T>(
     } catch (error) {
       const status = classifyTransportOutcome(error);
       if (hooks) {
+        const details = failedAuditDetails(error);
         await hooks.settle(context, {
           status,
-          errorName: typeof (error as { name?: unknown } | null)?.name === "string"
-            ? (error as { name: string }).name
-            : undefined,
-          errorMessage: error instanceof Error ? error.message : String(error),
+          ...details,
         }).catch((settleError) => {
           throw wrapAdmissionError(settleError);
         });
@@ -324,7 +451,8 @@ export function createAiSdkTransport(options?: {
   });
 
   return async (request, config) => {
-    const cacheKey = [config.apiKey ?? "", config.baseURL ?? "", config.model].join("|");
+    const customParams = canonicalizeCustomRequestParams(config.customRequestParams);
+    const cacheKey = [config.apiKey ?? "", config.baseURL ?? "", config.model, JSON.stringify(config.customHeaders ?? {}), JSON.stringify(customParams)].join("|");
     let provider = providerCache.get(cacheKey);
     if (!provider) {
       provider = createOpenAICompatible({
@@ -335,14 +463,19 @@ export function createAiSdkTransport(options?: {
         fetch: options?.fetch,
         supportsStructuredOutputs: !!options?.supportsStructuredOutputs,
         transformRequestBody: (body) => {
-          const next: Record<string, unknown> = { ...body };
+          const next: Record<string, unknown> = { ...body, ...customParams };
           // 本仓全部补全都以 JSON 模式工作（解析层消费 JSON 输出）。
           next.response_format = { type: "json_object" };
-          // MiniMax 私有 thinking 开关；OpenAI 兼容端点省略该字段即等价关闭。
-          if (isMiniMax(config)) {
-            next.thinking = { type: "disabled" };
+          // MiniMax 私有 thinking 开关（SDK 与兼容路径共用同一份能力策略）。
+          const thinkingPolicy = resolveThinkingPolicy(config);
+          if (thinkingPolicy.thinking) {
+            next.thinking = thinkingPolicy.thinking;
           }
-          return next;
+          // 强制思考的模型必须把思考分离出去，否则 think 标签会污染 JSON 正文。
+          if (thinkingPolicy.reasoningSplit) {
+            next.reasoning_split = true;
+          }
+          return { ...next, ...customParams };
         },
       });
       providerCache.set(cacheKey, provider);
@@ -470,6 +603,7 @@ export function createCompatClientTransport(
 
   const callOnce = (request: CompletionRequest, config: ModelApiConfig) => {
     const wire: Record<string, unknown> = {
+      ...canonicalizeCustomRequestParams(config.customRequestParams),
       model: config.model,
       messages: request.messages,
       max_tokens: request.maxTokens ?? undefined,
@@ -477,9 +611,16 @@ export function createCompatClientTransport(
       top_p: request.topP ?? undefined,
       response_format: request.requireCompleteJson ? { type: "json_object" } : undefined,
     };
-    if (isMiniMax(config)) {
-      wire.thinking = { type: "disabled" };
+    // MiniMax 私有 thinking 开关（与 SDK 路径共用同一份能力策略）。
+    const thinkingPolicy = resolveThinkingPolicy(config);
+    if (thinkingPolicy.thinking) {
+      wire.thinking = thinkingPolicy.thinking;
     }
+    // 强制思考的模型必须把思考分离出去，否则 think 标签会污染 JSON 正文。
+    if (thinkingPolicy.reasoningSplit) {
+      wire.reasoning_split = true;
+    }
+    Object.assign(wire, canonicalizeCustomRequestParams(config.customRequestParams));
     return typed.chat.completions.create(wire) as Promise<WireCompletionResponse>;
   };
 
