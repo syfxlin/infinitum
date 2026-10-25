@@ -75,4 +75,7 @@ next-env.d.ts
 
 # ZCode 工作区本地目录
 .zcode/
+.zed/
 .idea/
+.vscode/
+.gitnexus/
